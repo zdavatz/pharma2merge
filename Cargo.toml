@@ -1,0 +1,13 @@
+[package]
+name = "pharma2merge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking"] }
+calamine = "0.26"
+rayon = "1.10"
+csv = "1.3"
