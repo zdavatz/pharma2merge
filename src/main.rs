@@ -10,6 +10,25 @@ use chrono::{Local, Datelike};
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 
+// ─── Numeric flags (Swissmedic-side, matching Ruby NUMERIC_FLAGS) ───────────
+
+/// Flags 1-16 matching Ruby OuwerkerkPlugin::NUMERIC_FLAGS.
+/// The FOPH-side flags are defined in foph_diff::numeric_flags.
+/// Here we define the Swissmedic-relevant subset.
+mod swissmedic_flags {
+    #![allow(dead_code)]
+    pub const NEW: u8              = 1;
+    pub const NAME_BASE: u8        = 3;
+    pub const ADDRESS: u8          = 4;  // owner/company
+    pub const IKSCAT: u8           = 5;
+    pub const COMPOSITION: u8      = 6;
+    pub const INDICATION: u8       = 7;
+    pub const SEQUENCE: u8         = 8;  // handelsform (trade form / sequence info)
+    pub const EXPIRY_DATE: u8      = 9;
+    pub const DELETE: u8           = 14;
+    pub const NOT_SPECIFIED: u8    = 16;
+}
+
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SWISSMEDIC_URL: &str = "https://www.swissmedic.ch/dam/swissmedic/de/dokumente/internetlisten/zugelassene_packungen_human.xlsx.download.xlsx/zugelassene_packungen_ham.xlsx";
@@ -206,6 +225,44 @@ fn run_merge(price_path: &str, swissmedic_path: &str) -> Result<(), Box<dyn std:
     print_json_stats(price_path, &price_value);
     print_json_stats(swissmedic_path, &swissmedic_value);
 
+    // Print flag-coded summary from both sources
+    println!("\n=== Merged change summary (Ruby NUMERIC_FLAGS) ===");
+    println!("{:<5} {:<25}: Count", "Flag", "Category");
+    println!("--------------------------------------------------");
+
+    let print_category_count = |flag: u8, label: &str, value: &Value, key: &str| {
+        if let Some(arr) = value.get(key).and_then(|v| v.as_array()) {
+            if !arr.is_empty() {
+                println!("{:>3}   {:<25}: {}", flag, label, arr.len());
+            }
+        }
+    };
+
+    // FOPH/BSV price data
+    println!("\n  Price data ({}):", price_path);
+    print_category_count(1,  "new",              &price_value, "new");
+    print_category_count(14, "del (delete)",     &price_value, "del");
+    print_category_count(10, "sl_entry",         &price_value, "sl_entry");
+    print_category_count(2,  "sl_entry_delete",  &price_value, "sl_entry_delete");
+    print_category_count(3,  "name_base",        &price_value, "name_base");
+    print_category_count(13, "retail_up",        &price_value, "retail_up");
+    print_category_count(15, "retail_down",      &price_value, "retail_down");
+    print_category_count(13, "exfactory_up",     &price_value, "exfactory_up");
+    print_category_count(15, "exfactory_down",   &price_value, "exfactory_down");
+
+    // Swissmedic data
+    println!("\n  Swissmedic data ({}):", swissmedic_path);
+    print_category_count(1,  "added (new)",            &swissmedic_value, "added");
+    print_category_count(14, "deleted",                &swissmedic_value, "deleted");
+    print_category_count(3,  "Name (name_base)",       &swissmedic_value, "Name");
+    print_category_count(4,  "Owner (address)",        &swissmedic_value, "Owner");
+    print_category_count(5,  "Categorie (ikscat)",     &swissmedic_value, "Swissmedic_Categorie");
+    print_category_count(6,  "Active_Agent (comp)",    &swissmedic_value, "Active_Agent");
+    print_category_count(6,  "Composition",            &swissmedic_value, "Composition");
+    print_category_count(7,  "Indikation",             &swissmedic_value, "Indikation");
+    print_category_count(8,  "Handelsform (sequence)", &swissmedic_value, "Handelsform");
+    print_category_count(9,  "Date (expiry_date)",     &swissmedic_value, "Date");
+
     let mut root = Map::new();
 
     let mut metadata = Map::new();
@@ -224,6 +281,7 @@ fn run_merge(price_path: &str, swissmedic_path: &str) -> Result<(), Box<dyn std:
     File::create(&output_path)?.write_all(pretty_json.as_bytes())?;
 
     println!("\nMerge completed → {}", output_path);
+
     Ok(())
 }
 
@@ -368,13 +426,13 @@ fn run_swissmedic_diff(old_file: &str, new_file: &str) -> Result<(), Box<dyn std
     for (gtin, entry) in &new_data {
         if !old_data.contains_key(gtin) {
             let full_name = format!("{} {}", entry.name, entry.owner).trim().to_string();
-            added.push(json!({"gtin": gtin, "name": full_name}));
+            added.push(json!({"gtin": gtin, "name": full_name, "flags": [swissmedic_flags::NEW]}));
         }
     }
     for (gtin, entry) in &old_data {
         if !new_data.contains_key(gtin) {
             let full_name = format!("{} {}", entry.name, entry.owner).trim().to_string();
-            deleted.push(json!({"gtin": gtin, "name": full_name}));
+            deleted.push(json!({"gtin": gtin, "name": full_name, "flags": [swissmedic_flags::DELETE]}));
         }
     }
 
@@ -388,46 +446,78 @@ fn run_swissmedic_diff(old_file: &str, new_file: &str) -> Result<(), Box<dyn std
     let mut changes_composition: ChangeVec = Vec::new();
     let mut changes_indication: ChangeVec = Vec::new();
 
-    let make_change = |gtin: &str, product_name: &str, old_val: &str, new_val: &str| -> Value {
+    let make_change = |gtin: &str, product_name: &str, old_val: &str, new_val: &str, flags: Vec<u8>| -> Value {
         json!({
             "gtin": gtin,
             "product_name": product_name,
             "old": old_val,
             "new": new_val,
+            "flags": flags,
         })
+    };
+
+    // Normalize line endings for comparison
+    let normalize = |s: &str| -> String {
+        s.replace("\r\n", "\n").replace('\r', "\n")
+    };
+
+    let fields_equal = |a: &str, b: &str| -> bool {
+        normalize(a) == normalize(b)
     };
 
     for (gtin, old_entry) in &old_data {
         if let Some(new_entry) = new_data.get(gtin) {
             let pname = &new_entry.name;
-            if old_entry.name != new_entry.name {
-                changes_name.push(make_change(gtin, pname, &old_entry.name, &new_entry.name));
+            if !fields_equal(&old_entry.name, &new_entry.name) {
+                changes_name.push(make_change(gtin, pname, &old_entry.name, &new_entry.name, vec![swissmedic_flags::NAME_BASE]));
             }
-            if old_entry.owner != new_entry.owner {
-                changes_owner.push(make_change(gtin, pname, &old_entry.owner, &new_entry.owner));
+            if !fields_equal(&old_entry.owner, &new_entry.owner) {
+                changes_owner.push(make_change(gtin, pname, &old_entry.owner, &new_entry.owner, vec![swissmedic_flags::ADDRESS]));
             }
-            if old_entry.date != new_entry.date {
-                changes_date.push(make_change(gtin, pname, &old_entry.date, &new_entry.date));
+            if !fields_equal(&old_entry.date, &new_entry.date) {
+                changes_date.push(make_change(gtin, pname, &old_entry.date, &new_entry.date, vec![swissmedic_flags::EXPIRY_DATE]));
             }
-            if old_entry.handelsform != new_entry.handelsform {
-                changes_handelsform.push(make_change(gtin, pname, &old_entry.handelsform, &new_entry.handelsform));
+            if !fields_equal(&old_entry.handelsform, &new_entry.handelsform) {
+                changes_handelsform.push(make_change(gtin, pname, &old_entry.handelsform, &new_entry.handelsform, vec![swissmedic_flags::SEQUENCE]));
             }
-            if old_entry.category != new_entry.category {
-                changes_category.push(make_change(gtin, pname, &old_entry.category, &new_entry.category));
+            if !fields_equal(&old_entry.category, &new_entry.category) {
+                changes_category.push(make_change(gtin, pname, &old_entry.category, &new_entry.category, vec![swissmedic_flags::IKSCAT]));
             }
-            if old_entry.active_agent != new_entry.active_agent {
-                changes_agent.push(make_change(gtin, pname, &old_entry.active_agent, &new_entry.active_agent));
+            if !fields_equal(&old_entry.active_agent, &new_entry.active_agent) {
+                changes_agent.push(make_change(gtin, pname, &old_entry.active_agent, &new_entry.active_agent, vec![swissmedic_flags::COMPOSITION]));
             }
-            if old_entry.composition != new_entry.composition {
-                changes_composition.push(make_change(gtin, pname, &old_entry.composition, &new_entry.composition));
+            if !fields_equal(&old_entry.composition, &new_entry.composition) {
+                changes_composition.push(make_change(gtin, pname, &old_entry.composition, &new_entry.composition, vec![swissmedic_flags::COMPOSITION]));
             }
-            if old_entry.indication != new_entry.indication {
-                changes_indication.push(make_change(gtin, pname, &old_entry.indication, &new_entry.indication));
+            if !fields_equal(&old_entry.indication, &new_entry.indication) {
+                changes_indication.push(make_change(gtin, pname, &old_entry.indication, &new_entry.indication, vec![swissmedic_flags::INDICATION]));
             }
         }
     }
 
     let mut output = Map::new();
+
+    // Include numeric flag legend for downstream consumers (matching Ruby NUMERIC_FLAGS)
+    let legend = json!({
+        "1":  "new",
+        "2":  "sl_entry_delete",
+        "3":  "name_base",
+        "4":  "address",
+        "5":  "ikscat",
+        "6":  "composition",
+        "7":  "indication",
+        "8":  "sequence",
+        "9":  "expiry_date",
+        "10": "sl_entry",
+        "11": "price",
+        "12": "comment",
+        "13": "price_rise",
+        "14": "delete",
+        "15": "price_cut",
+        "16": "not_specified"
+    });
+    output.insert("_flag_legend".into(), legend);
+
     output.insert("deleted".into(), Value::Array(deleted.clone()));
     output.insert("added".into(), Value::Array(added.clone()));
     output.insert("Name".into(), Value::Array(changes_name.clone()));
@@ -480,17 +570,19 @@ fn run_swissmedic_diff(old_file: &str, new_file: &str) -> Result<(), Box<dyn std
     print_changes(&changes_composition, "Composition");
     print_changes(&changes_indication, "Indikation");
 
-    println!("\n=== Summary of changes per category ===");
-    println!("{:<21}: Changes", "Category");
-    println!("-----------------------------------------");
-    println!("{:<21}: {} changes", "Name", changes_name.len());
-    println!("{:<21}: {} changes", "Owner", changes_owner.len());
-    println!("{:<21}: {} changes", "Date", changes_date.len());
-    println!("{:<21}: {} changes", "Handelsform", changes_handelsform.len());
-    println!("{:<21}: {} changes", "Swissmedic Categorie", changes_category.len());
-    println!("{:<21}: {} changes", "Active Agent", changes_agent.len());
-    println!("{:<21}: {} changes", "Composition", changes_composition.len());
-    println!("{:<21}: {} changes", "Indikation", changes_indication.len());
+    println!("\n=== Summary of changes per category (with Ruby NUMERIC_FLAGS) ===");
+    println!("{:<5} {:<21}: Changes", "Flag", "Category");
+    println!("----------------------------------------------");
+    println!("{:<5} {:<21}: {} packs",  " 1",  "Added (new)",          added.len());
+    println!("{:<5} {:<21}: {} packs",  "14",  "Deleted",              deleted.len());
+    println!("{:<5} {:<21}: {} changes", " 3",  "Name",                changes_name.len());
+    println!("{:<5} {:<21}: {} changes", " 4",  "Owner (address)",     changes_owner.len());
+    println!("{:<5} {:<21}: {} changes", " 9",  "Date (expiry_date)",  changes_date.len());
+    println!("{:<5} {:<21}: {} changes", " 8",  "Handelsform (seq)",   changes_handelsform.len());
+    println!("{:<5} {:<21}: {} changes", " 5",  "Swissmedic Categorie", changes_category.len());
+    println!("{:<5} {:<21}: {} changes", " 6",  "Active Agent (comp)", changes_agent.len());
+    println!("{:<5} {:<21}: {} changes", " 6",  "Composition",         changes_composition.len());
+    println!("{:<5} {:<21}: {} changes", " 7",  "Indikation",          changes_indication.len());
 
     println!("\nJSON output written to: {}", output_filename);
     Ok(())

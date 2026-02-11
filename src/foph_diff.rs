@@ -5,6 +5,32 @@ use std::io::{Read, Write};
 use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 
+// ─── Numeric flags (matching Ruby ODDB::OuwerkerkPlugin::NUMERIC_FLAGS) ─────
+
+/// These numeric codes correspond 1:1 with the Ruby OuwerkerkPlugin:
+///   new: 1, sl_entry_delete: 2, name_base/productname: 3, address: 4,
+///   ikscat: 5, composition: 6, indication: 7, sequence: 8,
+///   expiry_date: 9, sl_entry: 10, price: 11, comment: 12,
+///   price_rise: 13, delete: 14, price_cut: 15, not_specified: 16
+pub mod numeric_flags {
+    #![allow(dead_code)]
+    pub const NEW: u8              = 1;
+    pub const SL_ENTRY_DELETE: u8  = 2;
+    pub const NAME_BASE: u8        = 3;
+    // pub const ADDRESS: u8       = 4;  // Swissmedic-side only (owner)
+    // pub const IKSCAT: u8        = 5;  // Swissmedic-side only
+    // pub const COMPOSITION: u8   = 6;  // Swissmedic-side only
+    // pub const INDICATION: u8    = 7;  // Swissmedic-side only
+    // pub const SEQUENCE: u8      = 8;  // Swissmedic-side only
+    // pub const EXPIRY_DATE: u8   = 9;  // Swissmedic-side only
+    pub const SL_ENTRY: u8         = 10;
+    pub const PRICE: u8            = 11;
+    pub const PRICE_RISE: u8       = 13;
+    pub const DELETE: u8           = 14;
+    pub const PRICE_CUT: u8        = 15;
+    pub const NOT_SPECIFIED: u8    = 16;
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -12,6 +38,7 @@ pub struct PackageInfo {
     pub name: String,
     pub retail_price: f64,
     pub exfactory_price: f64,
+    pub has_sl_entry: bool,
 }
 
 pub type DateTuple = (i32, i32, i32); // (year, month, day)
@@ -232,8 +259,9 @@ pub fn process_bundles(bundles: &[Value], current_dt: &DateTuple) -> PackageMap 
                 .unwrap_or("Unknown Product")
                 .to_string();
 
-            // Collect prices from RegulatedAuthorization resources
+            // Collect prices and SL status from RegulatedAuthorization resources
             let mut price_by_type: BTreeMap<String, BTreeMap<DateTuple, f64>> = BTreeMap::new();
+            let mut has_sl_entry = false;
 
             for (_, auth) in &resources {
                 if auth.get("resourceType").and_then(|v| v.as_str()) != Some("RegulatedAuthorization") {
@@ -260,6 +288,9 @@ pub fn process_bundles(bundles: &[Value], current_dt: &DateTuple) -> PackageMap 
                     .unwrap_or("");
 
                 if subject_ref != ppd_key { continue; }
+
+                // This package has an SL entry via RegulatedAuthorization
+                has_sl_entry = true;
 
                 // Extract price extensions
                 let extensions = match auth.get("extension").and_then(|v| v.as_array()) {
@@ -334,8 +365,15 @@ pub fn process_bundles(bundles: &[Value], current_dt: &DateTuple) -> PackageMap 
                 current_dt,
             );
 
-            if retail > 0.0 || exfactory > 0.0 {
-                packages.insert(gtin, PackageInfo { name, retail_price: retail, exfactory_price: exfactory });
+            // Include packages even without prices if they have an SL entry,
+            // so we can track SL status changes
+            if retail > 0.0 || exfactory > 0.0 || has_sl_entry {
+                packages.insert(gtin, PackageInfo {
+                    name,
+                    retail_price: retail,
+                    exfactory_price: exfactory,
+                    has_sl_entry,
+                });
             }
         }
     }
@@ -431,28 +469,86 @@ pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Re
 
     println!("Found {} packages (old), {} (new).", old_pkg.len(), new_pkg.len());
 
-    // Compute diff categories in parallel
+    // ── Compute all diff categories ──────────────────────────────────────────
+
+    // 1. New packages (flag 1: new)
     let new_packages: Vec<Value> = new_pkg.par_iter()
         .filter(|(gtin, _)| !old_pkg.contains_key(*gtin))
         .map(|(gtin, info)| json!({
             "gtin": gtin,
             "name": info.name,
+            "flags": [numeric_flags::NEW],
             "retail_price": if info.retail_price > 0.0 { json!(info.retail_price) } else { Value::Null },
             "exfactory_price": if info.exfactory_price > 0.0 { json!(info.exfactory_price) } else { Value::Null },
         }))
         .collect();
 
+    // 14. Package deletions (flag 14: delete)
     let package_deletions: Vec<Value> = old_pkg.par_iter()
         .filter(|(gtin, _)| !new_pkg.contains_key(*gtin))
         .map(|(gtin, info)| json!({
             "gtin": gtin,
             "name": info.name,
+            "flags": [numeric_flags::DELETE],
             "retail_price": if info.retail_price > 0.0 { json!(info.retail_price) } else { Value::Null },
             "exfactory_price": if info.exfactory_price > 0.0 { json!(info.exfactory_price) } else { Value::Null },
         }))
         .collect();
 
-    // Price changes: collect in parallel, then partition
+    // 10. SL entry additions (flag 10: sl_entry) — package exists in both but gained SL
+    let sl_entry_additions: Vec<Value> = new_pkg.par_iter()
+        .filter_map(|(gtin, new_info)| {
+            old_pkg.get(gtin).and_then(|old_info| {
+                if !old_info.has_sl_entry && new_info.has_sl_entry {
+                    Some(json!({
+                        "gtin": gtin,
+                        "name": new_info.name,
+                        "flags": [numeric_flags::SL_ENTRY],
+                    }))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // 2. SL entry deletions (flag 2: sl_entry_delete) — package exists in both but lost SL
+    let sl_entry_deletions: Vec<Value> = new_pkg.par_iter()
+        .filter_map(|(gtin, new_info)| {
+            old_pkg.get(gtin).and_then(|old_info| {
+                if old_info.has_sl_entry && !new_info.has_sl_entry {
+                    Some(json!({
+                        "gtin": gtin,
+                        "name": new_info.name,
+                        "flags": [numeric_flags::SL_ENTRY_DELETE],
+                    }))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // 3. Name changes (flag 3: name_base)
+    let name_changes: Vec<Value> = new_pkg.par_iter()
+        .filter_map(|(gtin, new_info)| {
+            old_pkg.get(gtin).and_then(|old_info| {
+                if old_info.name != new_info.name {
+                    Some(json!({
+                        "gtin": gtin,
+                        "name": new_info.name,
+                        "flags": [numeric_flags::NAME_BASE],
+                        "old_name": old_info.name,
+                        "new_name": new_info.name,
+                    }))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // 11/13/15. Price changes with directional flags
     let price_changes: Vec<Value> = new_pkg.par_iter()
         .filter_map(|(gtin, new_info)| {
             old_pkg.get(gtin).map(|old_info| {
@@ -462,13 +558,21 @@ pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Re
                     ("exfactory", old_info.exfactory_price, new_info.exfactory_price),
                 ] {
                     if (new_p - old_p).abs() > 0.001 {
+                        let diff = new_p - old_p;
+                        // flag 11 (price) always present, plus 13 (price_rise) or 15 (price_cut)
+                        let flags = if diff > 0.0 {
+                            vec![numeric_flags::PRICE, numeric_flags::PRICE_RISE]
+                        } else {
+                            vec![numeric_flags::PRICE, numeric_flags::PRICE_CUT]
+                        };
                         changes.push(json!({
                             "gtin": gtin,
                             "name": new_info.name,
+                            "flags": flags,
                             "type": ptype,
                             "old_price": if old_p > 0.0 { json!(old_p) } else { Value::Null },
                             "new_price": if new_p > 0.0 { json!(new_p) } else { Value::Null },
-                            "difference": new_p - old_p,
+                            "difference": diff,
                         }));
                     }
                 }
@@ -497,6 +601,9 @@ pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Re
 
     let n_new = new_packages.len();
     let n_del = package_deletions.len();
+    let n_sl_add = sl_entry_additions.len();
+    let n_sl_del = sl_entry_deletions.len();
+    let n_name = name_changes.len();
     let n_ru = retail_up.len();
     let n_rd = retail_down.len();
     let n_eu = exfactory_up.len();
@@ -504,15 +611,20 @@ pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Re
 
     // If a filter is set, just print GTINs for that category and exit
     if let Some(cat) = filter {
-        let items = match cat {
+        let items: &[Value] = match cat {
             "new" => &new_packages,
-            "del" => &package_deletions,
-            "retail_up" => &retail_up,
-            "retail_down" => &retail_down,
-            "exfactory_up" => &exfactory_up,
-            "exfactory_down" => &exfactory_down,
+            "del" | "delete" => &package_deletions,
+            "sl_entry" => &sl_entry_additions,
+            "sl_entry_delete" => &sl_entry_deletions,
+            "name" | "name_base" | "productname" => &name_changes,
+            "retail_up" | "price_rise_retail" => &retail_up,
+            "retail_down" | "price_cut_retail" => &retail_down,
+            "exfactory_up" | "price_rise_exfactory" => &exfactory_up,
+            "exfactory_down" | "price_cut_exfactory" => &exfactory_down,
             _ => {
-                eprintln!("Unknown category '{}'. Valid: new, del, retail_up, retail_down, exfactory_up, exfactory_down", cat);
+                eprintln!("Unknown category '{}'.", cat);
+                eprintln!("Valid: new, del, sl_entry, sl_entry_delete, name,");
+                eprintln!("       retail_up, retail_down, exfactory_up, exfactory_down");
                 std::process::exit(1);
             }
         };
@@ -525,8 +637,33 @@ pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Re
     }
 
     let mut output = Map::new();
+
+    // Include numeric flag legend for downstream consumers
+    let legend = json!({
+        "1":  "new",
+        "2":  "sl_entry_delete",
+        "3":  "name_base",
+        "4":  "address",
+        "5":  "ikscat",
+        "6":  "composition",
+        "7":  "indication",
+        "8":  "sequence",
+        "9":  "expiry_date",
+        "10": "sl_entry",
+        "11": "price",
+        "12": "comment",
+        "13": "price_rise",
+        "14": "delete",
+        "15": "price_cut",
+        "16": "not_specified"
+    });
+    output.insert("_flag_legend".into(), legend);
+
     output.insert("new".into(), Value::Array(new_packages));
     output.insert("del".into(), Value::Array(package_deletions));
+    output.insert("sl_entry".into(), Value::Array(sl_entry_additions));
+    output.insert("sl_entry_delete".into(), Value::Array(sl_entry_deletions));
+    output.insert("name_base".into(), Value::Array(name_changes));
     output.insert("retail_up".into(), Value::Array(retail_up));
     output.insert("retail_down".into(), Value::Array(retail_down));
     output.insert("exfactory_up".into(), Value::Array(exfactory_up));
@@ -542,9 +679,16 @@ pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Re
     let pretty = serde_json::to_string_pretty(&Value::Object(output))?;
     std::fs::File::create(&output_filename)?.write_all(pretty.as_bytes())?;
 
-    println!("Diff written to {} ({} new, {} del, {} retail_up, {} retail_down, {} exfactory_up, {} exfactory_down)",
-        output_filename, n_new, n_del, n_ru, n_rd, n_eu, n_ed,
-    );
+    println!("Diff written to {}", output_filename);
+    println!("  flag  1 new:              {}", n_new);
+    println!("  flag 14 del:              {}", n_del);
+    println!("  flag 10 sl_entry:         {}", n_sl_add);
+    println!("  flag  2 sl_entry_delete:  {}", n_sl_del);
+    println!("  flag  3 name_base:        {}", n_name);
+    println!("  flag 13 retail_up:        {}", n_ru);
+    println!("  flag 15 retail_down:      {}", n_rd);
+    println!("  flag 13 exfactory_up:     {}", n_eu);
+    println!("  flag 15 exfactory_down:   {}", n_ed);
 
     Ok(())
 }
