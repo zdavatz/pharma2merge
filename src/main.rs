@@ -205,7 +205,7 @@ fn print_json_stats(label: &str, value: &Value) {
     }
 }
 
-fn run_merge(price_path: &str, swissmedic_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_merge(price_path: &str, swissmedic_path: &str, html: bool) -> Result<(), Box<dyn std::error::Error>> {
     let today = Local::now().date_naive();
     let date_str = format!("{:02}.{:02}.{}", today.day(), today.month(), today.year());
     let output_path = format!("diff/med-drugs-update_{}.json", date_str);
@@ -277,11 +277,279 @@ fn run_merge(price_path: &str, swissmedic_path: &str) -> Result<(), Box<dyn std:
     root.insert("price_data".into(), price_value);
     root.insert("swissmedic_data".into(), swissmedic_value);
 
-    let pretty_json = serde_json::to_string_pretty(&Value::Object(root))?;
+    let pretty_json = serde_json::to_string_pretty(&Value::Object(root.clone()))?;
     File::create(&output_path)?.write_all(pretty_json.as_bytes())?;
 
     println!("\nMerge completed → {}", output_path);
 
+    if html {
+        let html_path = output_path.replace(".json", ".html");
+        generate_html_diff(&Value::Object(root), &html_path)?;
+        println!("HTML output  → {}", html_path);
+    }
+
+    Ok(())
+}
+
+// ─── HTML diff output ───────────────────────────────────────────────────────
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn generate_html_diff(merged: &Value, html_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let meta = merged.get("metadata");
+    let generated_on = meta.and_then(|m| m["generated_on"].as_str()).unwrap_or("unknown");
+
+    let mut html = String::with_capacity(64 * 1024);
+    html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    html.push_str("<title>Pharma Diff Report – ");
+    html.push_str(&html_escape(generated_on));
+    html.push_str("</title>\n<style>\n");
+    html.push_str(r#"
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin: 2em; color: #24292e; background: #fff; }
+h1 { border-bottom: 2px solid #e1e4e8; padding-bottom: .3em; }
+h2 { margin-top: 2em; color: #0366d6; }
+h3 { margin-top: 1.5em; }
+table { border-collapse: collapse; width: 100%; margin: .5em 0 1.5em; font-size: 0.92em; }
+th, td { border: 1px solid #d1d5da; padding: 6px 10px; text-align: left; vertical-align: top; }
+th { background: #f6f8fa; font-weight: 600; }
+.added { background: #e6ffec; }
+.deleted { background: #ffeef0; }
+.old { color: #b31d28; text-decoration: line-through; }
+.new { color: #22863a; font-weight: 500; }
+.gtin { font-family: monospace; white-space: nowrap; }
+.summary-table td:last-child { text-align: right; font-weight: 600; }
+.price-up { color: #b31d28; }
+.price-down { color: #22863a; }
+.toc { background: #f6f8fa; padding: 1em 1.5em; border-radius: 6px; margin-bottom: 2em; }
+.toc a { text-decoration: none; color: #0366d6; }
+.toc ul { margin: .3em 0; padding-left: 1.5em; }
+"#);
+    html.push_str("</style>\n</head>\n<body>\n");
+
+    // Header
+    html.push_str(&format!("<h1>Pharma Diff Report – {}</h1>\n", html_escape(generated_on)));
+
+    // Helper: render a simple added/deleted table
+    let render_add_del_table = |html: &mut String, items: &[Value], css_class: &str, show_prices: bool| {
+        html.push_str("<table>\n<tr><th>GTIN</th><th>Name</th>");
+        if show_prices {
+            html.push_str("<th>Retail</th><th>Ex-factory</th>");
+        }
+        html.push_str("</tr>\n");
+        for item in items {
+            let gtin = item["gtin"].as_str().unwrap_or("");
+            let name = item["name"].as_str().unwrap_or("");
+            html.push_str(&format!("<tr class=\"{}\"><td class=\"gtin\">{}</td><td>{}</td>",
+                css_class, html_escape(gtin), html_escape(name)));
+            if show_prices {
+                let retail = item.get("retail_price").and_then(|v| v.as_f64());
+                let exf = item.get("exfactory_price").and_then(|v| v.as_f64());
+                html.push_str(&format!("<td>{}</td><td>{}</td>",
+                    retail.map(|p| format!("{:.2}", p)).unwrap_or_default(),
+                    exf.map(|p| format!("{:.2}", p)).unwrap_or_default(),
+                ));
+            }
+            html.push_str("</tr>\n");
+        }
+        html.push_str("</table>\n");
+    };
+
+    // Helper: render a field-change table (old→new)
+    let render_change_table = |html: &mut String, items: &[Value], old_key: &str, new_key: &str| {
+        html.push_str("<table>\n<tr><th>GTIN</th><th>Name</th><th>Old</th><th>New</th></tr>\n");
+        for item in items {
+            let gtin = item["gtin"].as_str().unwrap_or("");
+            let name = item["name"].as_str()
+                .or_else(|| item["product_name"].as_str())
+                .unwrap_or("");
+            let old_v = item[old_key].as_str().unwrap_or("");
+            let new_v = item[new_key].as_str().unwrap_or("");
+            html.push_str(&format!(
+                "<tr><td class=\"gtin\">{}</td><td>{}</td><td class=\"old\">{}</td><td class=\"new\">{}</td></tr>\n",
+                html_escape(gtin), html_escape(name), html_escape(old_v), html_escape(new_v)
+            ));
+        }
+        html.push_str("</table>\n");
+    };
+
+    // Helper: render price-change table
+    let render_price_table = |html: &mut String, items: &[Value], direction: &str| {
+        let css = if direction == "up" { "price-up" } else { "price-down" };
+        html.push_str("<table>\n<tr><th>GTIN</th><th>Name</th><th>Type</th><th>Old Price</th><th>New Price</th><th>Difference</th></tr>\n");
+        for item in items {
+            let gtin = item["gtin"].as_str().unwrap_or("");
+            let name = item["name"].as_str().unwrap_or("");
+            let ptype = item["type"].as_str().unwrap_or("");
+            let old_p = item["old_price"].as_f64();
+            let new_p = item["new_price"].as_f64();
+            let diff = item["difference"].as_f64().unwrap_or(0.0);
+            html.push_str(&format!(
+                "<tr><td class=\"gtin\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{:+.2}</td></tr>\n",
+                html_escape(gtin), html_escape(name), ptype,
+                old_p.map(|p| format!("{:.2}", p)).unwrap_or_default(),
+                new_p.map(|p| format!("{:.2}", p)).unwrap_or_default(),
+                css, diff
+            ));
+        }
+        html.push_str("</table>\n");
+    };
+
+    // ── Table of Contents ────────────────────────────────────────────────
+    html.push_str("<div class=\"toc\"><strong>Contents</strong>\n<ul>\n");
+    html.push_str("<li><a href=\"#summary\">Summary</a></li>\n");
+    html.push_str("<li><a href=\"#foph\">FOPH / BAG Price Data</a></li>\n");
+    html.push_str("<li><a href=\"#swissmedic\">Swissmedic Data</a></li>\n");
+    html.push_str("</ul></div>\n");
+
+    // ── Summary table ────────────────────────────────────────────────────
+    let price_data = merged.get("price_data");
+    let sm_data = merged.get("swissmedic_data");
+
+    let count = |data: Option<&Value>, key: &str| -> usize {
+        data.and_then(|d| d.get(key)).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+    };
+
+    html.push_str("<h2 id=\"summary\">Summary</h2>\n");
+    html.push_str("<table class=\"summary-table\">\n<tr><th>Flag</th><th>Category</th><th>Source</th><th>Count</th></tr>\n");
+
+    let summary_rows: Vec<(&str, &str, &str, usize)> = vec![
+        ("1",  "New packages",        "FOPH",       count(price_data, "new")),
+        ("14", "Deleted packages",     "FOPH",       count(price_data, "del")),
+        ("10", "SL entry additions",   "FOPH",       count(price_data, "sl_entry")),
+        ("2",  "SL entry deletions",   "FOPH",       count(price_data, "sl_entry_delete")),
+        ("3",  "Name changes",         "FOPH",       count(price_data, "name_base")),
+        ("13", "Retail price ↑",       "FOPH",       count(price_data, "retail_up")),
+        ("15", "Retail price ↓",       "FOPH",       count(price_data, "retail_down")),
+        ("13", "Ex-factory price ↑",   "FOPH",       count(price_data, "exfactory_up")),
+        ("15", "Ex-factory price ↓",   "FOPH",       count(price_data, "exfactory_down")),
+        ("1",  "Added packs",          "Swissmedic", count(sm_data, "added")),
+        ("14", "Deleted packs",        "Swissmedic", count(sm_data, "deleted")),
+        ("3",  "Name",                 "Swissmedic", count(sm_data, "Name")),
+        ("4",  "Owner",                "Swissmedic", count(sm_data, "Owner")),
+        ("9",  "Date",                 "Swissmedic", count(sm_data, "Date")),
+        ("8",  "Handelsform",          "Swissmedic", count(sm_data, "Handelsform")),
+        ("5",  "Swissmedic Categorie", "Swissmedic", count(sm_data, "Swissmedic_Categorie")),
+        ("6",  "Active Agent",         "Swissmedic", count(sm_data, "Active_Agent")),
+        ("6",  "Composition",          "Swissmedic", count(sm_data, "Composition")),
+        ("7",  "Indikation",           "Swissmedic", count(sm_data, "Indikation")),
+    ];
+
+    for (flag, cat, source, n) in &summary_rows {
+        if *n > 0 {
+            html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                flag, cat, source, n));
+        }
+    }
+    html.push_str("</table>\n");
+
+    // ── FOPH Price Data ──────────────────────────────────────────────────
+    html.push_str("<h2 id=\"foph\">FOPH / BAG Price Data</h2>\n");
+
+    if let Some(pd) = price_data {
+        let arr = |key: &str| -> &[Value] {
+            pd.get(key).and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[])
+        };
+
+        let new_pkgs = arr("new");
+        if !new_pkgs.is_empty() {
+            html.push_str(&format!("<h3>New packages ({})</h3>\n", new_pkgs.len()));
+            render_add_del_table(&mut html, new_pkgs, "added", true);
+        }
+
+        let del_pkgs = arr("del");
+        if !del_pkgs.is_empty() {
+            html.push_str(&format!("<h3>Deleted packages ({})</h3>\n", del_pkgs.len()));
+            render_add_del_table(&mut html, del_pkgs, "deleted", true);
+        }
+
+        let sl_add = arr("sl_entry");
+        if !sl_add.is_empty() {
+            html.push_str(&format!("<h3>SL entry additions ({})</h3>\n", sl_add.len()));
+            render_add_del_table(&mut html, sl_add, "added", false);
+        }
+
+        let sl_del = arr("sl_entry_delete");
+        if !sl_del.is_empty() {
+            html.push_str(&format!("<h3>SL entry deletions ({})</h3>\n", sl_del.len()));
+            render_add_del_table(&mut html, sl_del, "deleted", false);
+        }
+
+        let names = arr("name_base");
+        if !names.is_empty() {
+            html.push_str(&format!("<h3>Name changes ({})</h3>\n", names.len()));
+            render_change_table(&mut html, names, "old_name", "new_name");
+        }
+
+        let ru = arr("retail_up");
+        if !ru.is_empty() {
+            html.push_str(&format!("<h3>Retail price increases ({})</h3>\n", ru.len()));
+            render_price_table(&mut html, ru, "up");
+        }
+
+        let rd = arr("retail_down");
+        if !rd.is_empty() {
+            html.push_str(&format!("<h3>Retail price decreases ({})</h3>\n", rd.len()));
+            render_price_table(&mut html, rd, "down");
+        }
+
+        let eu = arr("exfactory_up");
+        if !eu.is_empty() {
+            html.push_str(&format!("<h3>Ex-factory price increases ({})</h3>\n", eu.len()));
+            render_price_table(&mut html, eu, "up");
+        }
+
+        let ed = arr("exfactory_down");
+        if !ed.is_empty() {
+            html.push_str(&format!("<h3>Ex-factory price decreases ({})</h3>\n", ed.len()));
+            render_price_table(&mut html, ed, "down");
+        }
+    }
+
+    // ── Swissmedic Data ──────────────────────────────────────────────────
+    html.push_str("<h2 id=\"swissmedic\">Swissmedic Data</h2>\n");
+
+    if let Some(sm) = sm_data {
+        let arr = |key: &str| -> &[Value] {
+            sm.get(key).and_then(|v| v.as_array()).map(|a| a.as_slice()).unwrap_or(&[])
+        };
+
+        let added = arr("added");
+        if !added.is_empty() {
+            html.push_str(&format!("<h3>Added packs ({})</h3>\n", added.len()));
+            render_add_del_table(&mut html, added, "added", false);
+        }
+
+        let deleted = arr("deleted");
+        if !deleted.is_empty() {
+            html.push_str(&format!("<h3>Deleted packs ({})</h3>\n", deleted.len()));
+            render_add_del_table(&mut html, deleted, "deleted", false);
+        }
+
+        for (key, title) in [
+            ("Name", "Name"),
+            ("Owner", "Owner"),
+            ("Date", "Date"),
+            ("Handelsform", "Handelsform"),
+            ("Swissmedic_Categorie", "Swissmedic Categorie"),
+            ("Active_Agent", "Active Agent"),
+            ("Composition", "Composition"),
+            ("Indikation", "Indikation"),
+        ] {
+            let items = arr(key);
+            if !items.is_empty() {
+                html.push_str(&format!("<h3>{} changes ({})</h3>\n", title, items.len()));
+                render_change_table(&mut html, items, "old", "new");
+            }
+        }
+    }
+
+    html.push_str("\n</body>\n</html>\n");
+    File::create(html_path)?.write_all(html.as_bytes())?;
     Ok(())
 }
 
@@ -611,8 +879,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_swissmedic_diff(&args[2], &args[3]);
     }
 
+    if args.len() == 4 && args[1] == "--html" && !args[2].starts_with('-') {
+        return run_merge(&args[2], &args[3], true);
+    }
+
     if args.len() == 3 && !args[1].starts_with('-') {
-        return run_merge(&args[1], &args[2]);
+        return run_merge(&args[1], &args[2], false);
     }
 
     eprintln!("Usage:");
@@ -630,5 +902,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!();
     eprintln!("  {} <price_changes.json> <swissmedic_changes.json>", args[0]);
     eprintln!("    Merge two JSON files into 'diff/med-drugs-update_dd.mm.yyyy.json'.");
+    eprintln!();
+    eprintln!("  {} --html <price_changes.json> <swissmedic_changes.json>", args[0]);
+    eprintln!("    Same as above, plus generate an HTML report alongside the JSON.");
     std::process::exit(1);
 }
