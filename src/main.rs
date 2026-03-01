@@ -32,7 +32,8 @@ mod swissmedic_flags {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SWISSMEDIC_URL: &str = "https://www.swissmedic.ch/dam/swissmedic/de/dokumente/internetlisten/zugelassene_packungen_human.xlsx.download.xlsx/zugelassene_packungen_ham.xlsx";
-const FOPH_SL_URL: &str = "https://epl.bag.admin.ch/static/fhir/foph-sl-export-20260203.ndjson";
+const FOPH_RESOURCES_URL: &str = "https://epl.bag.admin.ch/api/sl/public/resources/current";
+const FOPH_STATIC_BASE: &str = "https://epl.bag.admin.ch/static/";
 
 // ─── JSON sanitizer ──────────────────────────────────────────────────────────
 
@@ -77,6 +78,24 @@ fn csv_escape(field: &str) -> String {
 }
 
 // ─── Download helpers ────────────────────────────────────────────────────────
+
+fn resolve_foph_ndjson_url(client: &Client) -> Result<String, Box<dyn std::error::Error>> {
+    println!("Fetching latest FOPH resource index from: {}", FOPH_RESOURCES_URL);
+    let response = client.get(FOPH_RESOURCES_URL).send()?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {} for {}", status, FOPH_RESOURCES_URL).into());
+    }
+    let body = response.text()?;
+    let json: Value = serde_json::from_str(&body)?;
+    let file_url = json.get("fhir")
+        .and_then(|f: &Value| f.get("fileUrl"))
+        .and_then(|v: &Value| v.as_str())
+        .ok_or("Could not find fhir.fileUrl in API response")?;
+    let full_url = format!("{}{}", FOPH_STATIC_BASE, file_url);
+    println!("  Latest FOPH NDJSON: {}", full_url);
+    Ok(full_url)
+}
 
 fn download_url(client: &Client, url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     println!("Downloading: {}", url);
@@ -188,7 +207,8 @@ fn run_download(swissmedic: bool, fhir: bool) -> Result<(), Box<dyn std::error::
     if fhir {
         fs::create_dir_all("ndjson")?;
         let foph_ndjson = format!("ndjson/sl_foph_{}.ndjson", date_str);
-        let ndjson_bytes = download_url(&client, FOPH_SL_URL)?;
+        let foph_url = resolve_foph_ndjson_url(&client)?;
+        let ndjson_bytes = download_url(&client, &foph_url)?;
         File::create(&foph_ndjson)?.write_all(&ndjson_bytes)?;
         println!("\nDownload completed:");
         println!("  {}", foph_ndjson);
