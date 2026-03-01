@@ -168,7 +168,7 @@ pub fn get_file_mod_date(filename: &str) -> String {
 
 // ─── Run modes ───────────────────────────────────────────────────────────────
 
-fn run_download() -> Result<(), Box<dyn std::error::Error>> {
+fn run_download(swissmedic: bool, fhir: bool) -> Result<(), Box<dyn std::error::Error>> {
     let today = Local::now().date_naive();
     let date_str = format!("{:02}.{:02}.{}", today.day(), today.month(), today.year());
 
@@ -176,21 +176,24 @@ fn run_download() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
-    fs::create_dir_all("csv")?;
-    fs::create_dir_all("ndjson")?;
+    if swissmedic {
+        fs::create_dir_all("csv")?;
+        let swissmedic_csv = format!("csv/swissmedic_{}.csv", date_str);
+        let xlsx_bytes = download_url(&client, SWISSMEDIC_URL)?;
+        xlsx_to_csv(&xlsx_bytes, &swissmedic_csv)?;
+        println!("\nDownload completed:");
+        println!("  {}", swissmedic_csv);
+    }
 
-    let swissmedic_csv = format!("csv/swissmedic_{}.csv", date_str);
-    let xlsx_bytes = download_url(&client, SWISSMEDIC_URL)?;
-    xlsx_to_csv(&xlsx_bytes, &swissmedic_csv)?;
+    if fhir {
+        fs::create_dir_all("ndjson")?;
+        let foph_ndjson = format!("ndjson/sl_foph_{}.ndjson", date_str);
+        let ndjson_bytes = download_url(&client, FOPH_SL_URL)?;
+        File::create(&foph_ndjson)?.write_all(&ndjson_bytes)?;
+        println!("\nDownload completed:");
+        println!("  {}", foph_ndjson);
+    }
 
-    let foph_ndjson = format!("ndjson/sl_foph_{}.ndjson", date_str);
-    let ndjson_bytes = download_url(&client, FOPH_SL_URL)?;
-    File::create(&foph_ndjson)?.write_all(&ndjson_bytes)?;
-    println!("  Saved: {}", foph_ndjson);
-
-    println!("\nDownload completed:");
-    println!("  {}", swissmedic_csv);
-    println!("  {}", foph_ndjson);
     Ok(())
 }
 
@@ -861,8 +864,16 @@ fn run_swissmedic_diff(old_file: &str, new_file: &str) -> Result<(), Box<dyn std
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() == 2 && args[1] == "--download" {
-        return run_download();
+    if args.len() >= 2 && args[1] == "--download" {
+        if args.len() == 2 {
+            return run_download(true, true);
+        }
+        if args.len() == 3 && args[2] == "--fhir" {
+            return run_download(false, true);
+        }
+        if args.len() == 3 && args[2] == "--swissmedic" {
+            return run_download(true, false);
+        }
     }
 
     if args.len() == 4 && args[1] == "--foph-diff" {
@@ -889,7 +900,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Usage:");
     eprintln!("  {} --download", args[0]);
-    eprintln!("    Download Swissmedic xlsx (→ CSV) and FOPH SL ndjson to current directory.");
+    eprintln!("    Download both Swissmedic xlsx (→ CSV) and FOPH SL ndjson.");
+    eprintln!();
+    eprintln!("  {} --download --fhir", args[0]);
+    eprintln!("    Download only the FOPH SL ndjson.");
+    eprintln!();
+    eprintln!("  {} --download --swissmedic", args[0]);
+    eprintln!("    Download only the Swissmedic xlsx (→ CSV).");
     eprintln!();
     eprintln!("  {} --foph-diff <old.ndjson> <new.ndjson>", args[0]);
     eprintln!("    Compare two FOPH SL exports and output price/package diff as JSON.");

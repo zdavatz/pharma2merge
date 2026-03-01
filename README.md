@@ -55,10 +55,10 @@ cargo build --release
 ### Download current data
 
 ```bash
-pharma2merge --download
+pharma2merge --download              # both Swissmedic and FOPH
+pharma2merge --download --fhir       # FOPH SL ndjson only
+pharma2merge --download --swissmedic # Swissmedic xlsx (→ CSV) only
 ```
-
-Downloads `csv/swissmedic_DD.MM.YYYY.csv` and `ndjson/sl_foph_DD.MM.YYYY.ndjson`.
 
 ### Swissmedic diff
 
