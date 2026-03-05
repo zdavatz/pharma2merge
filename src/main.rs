@@ -331,11 +331,11 @@ fn run_update(html: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Determine diff output filenames
     let old_ndjson_date = foph_diff::extract_date_from_path(&old_ndjson);
     let new_ndjson_date = foph_diff::extract_date_from_path(&new_ndjson_path);
-    let foph_diff_path = format!("ndjson/diff_{}-{}.json", old_ndjson_date, new_ndjson_date);
+    let foph_diff_path = format!("ndjson/diff/diff_{}-{}.json", old_ndjson_date, new_ndjson_date);
 
     let old_csv_date = extract_swissmedic_date(&old_csv).unwrap_or_else(|| "old".to_string());
     let new_csv_date = extract_swissmedic_date(&new_csv_path).unwrap_or_else(|| "new".to_string());
-    let sm_diff_path = format!("csv/diff_{}-{}.json", old_csv_date, new_csv_date);
+    let sm_diff_path = format!("csv/diff/diff_{}-{}.json", old_csv_date, new_csv_date);
 
     println!("\n=== Merge: {} + {} ===\n", foph_diff_path, sm_diff_path);
     run_merge(&foph_diff_path, &sm_diff_path, html)?;
@@ -976,8 +976,8 @@ fn run_swissmedic_diff(old_file: &str, new_file: &str) -> Result<(), Box<dyn std
     output.insert("Composition".into(), Value::Array(changes_composition.clone()));
     output.insert("Indikation".into(), Value::Array(changes_indication.clone()));
 
-    fs::create_dir_all("csv")?;
-    let output_filename = format!("csv/diff_{}-{}.json", old_date, new_date);
+    fs::create_dir_all("csv/diff")?;
+    let output_filename = format!("csv/diff/diff_{}-{}.json", old_date, new_date);
 
     let pretty = serde_json::to_string_pretty(&Value::Object(output))?;
     File::create(&output_filename)?.write_all(pretty.as_bytes())?;

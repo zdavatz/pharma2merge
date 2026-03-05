@@ -75,7 +75,7 @@ pharma2merge --download --swissmedic # Swissmedic xlsx (→ CSV) only
 pharma2merge --swissmedic-diff csv/swissmedic_07.01.2026.csv csv/swissmedic_06.02.2026.csv
 ```
 
-Outputs `csv/diff_07.01.2026-06.02.2026.json`.
+Outputs `csv/diff/diff_07.01.2026-06.02.2026.json`.
 
 ### FOPH / BAG price diff
 
@@ -83,7 +83,7 @@ Outputs `csv/diff_07.01.2026-06.02.2026.json`.
 pharma2merge --foph-diff ndjson/sl_foph_05.01.2026.ndjson ndjson/sl_foph_06.02.2026.ndjson
 ```
 
-Outputs `ndjson/diff_05.01.2026-06.02.2026.json`.
+Outputs `ndjson/diff/diff_05.01.2026-06.02.2026.json`.
 
 Filter by category (prints GTINs only):
 
@@ -94,7 +94,7 @@ pharma2merge --foph-diff --retail_up ndjson/sl_foph_old.ndjson ndjson/sl_foph_ne
 ### Merge into final report
 
 ```bash
-pharma2merge ndjson/diff_05.01.2026-06.02.2026.json csv/diff_07.01.2026-06.02.2026.json
+pharma2merge ndjson/diff/diff_05.01.2026-06.02.2026.json csv/diff/diff_07.01.2026-06.02.2026.json
 ```
 
 Outputs `diff/med-drugs-update_DD.MM.YYYY.json`.
@@ -102,7 +102,7 @@ Outputs `diff/med-drugs-update_DD.MM.YYYY.json`.
 ### Merge with HTML output
 
 ```bash
-pharma2merge --html ndjson/diff_05.01.2026-06.02.2026.json csv/diff_07.01.2026-06.02.2026.json
+pharma2merge --html ndjson/diff/diff_05.01.2026-06.02.2026.json csv/diff/diff_07.01.2026-06.02.2026.json
 ```
 
 Outputs both the JSON and an HTML report at `diff/med-drugs-update_DD.MM.YYYY.html`.
@@ -111,8 +111,10 @@ Outputs both the JSON and an HTML report at `diff/med-drugs-update_DD.MM.YYYY.ht
 
 | Directory | Contents |
 |---|---|
-| `csv/` | Swissmedic CSV snapshots and Swissmedic diff JSON |
-| `ndjson/` | FOPH SL NDJSON exports and FOPH diff JSON |
+| `csv/` | Swissmedic CSV snapshots |
+| `csv/diff/` | Swissmedic diff JSON |
+| `ndjson/` | FOPH SL NDJSON exports |
+| `ndjson/diff/` | FOPH diff JSON |
 | `diff/` | Merged `med-drugs-update` JSON and HTML reports |
 
 ## License

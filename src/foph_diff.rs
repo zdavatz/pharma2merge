@@ -713,9 +713,9 @@ pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Re
     output.insert("exfactory_up".into(), Value::Array(exfactory_up));
     output.insert("exfactory_down".into(), Value::Array(exfactory_down));
 
-    fs::create_dir_all("ndjson")?;
+    fs::create_dir_all("ndjson/diff")?;
 
-    let output_filename = format!("ndjson/diff_{}-{}.json",
+    let output_filename = format!("ndjson/diff/diff_{}-{}.json",
         if old_date_str == "unknown" { "old".to_string() } else { old_date_str },
         if new_date_str == "unknown" { "new".to_string() } else { new_date_str },
     );

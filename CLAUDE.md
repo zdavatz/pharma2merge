@@ -27,8 +27,10 @@ cargo build --release
 
 ## Data Directories
 
-- `csv/` — Swissmedic CSV files and diff output (not committed)
-- `ndjson/` — FOPH SL exports and diff output (not committed)
+- `csv/` — Swissmedic CSV files (not committed)
+- `csv/diff/` — Swissmedic diff JSON output (not committed)
+- `ndjson/` — FOPH SL NDJSON exports (not committed)
+- `ndjson/diff/` — FOPH diff JSON output (not committed)
 - `diff/` — Merged reports (not committed)
 
 ## Dependencies
