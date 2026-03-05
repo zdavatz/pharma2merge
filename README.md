@@ -52,6 +52,15 @@ cargo build --release
 
 ## Usage
 
+### Automated update (download, diff, merge)
+
+```bash
+pharma2merge --update          # download both, diff, merge — only if both sources have new data
+pharma2merge --update --html   # same, plus generate HTML report
+```
+
+Checks Swissmedic XLSX size against a saved value (`csv/.swissmedic_xlsx_size`) to avoid unnecessary downloads. Then downloads and compares FOPH NDJSON size against the latest local file. Only proceeds if **both** sources have new data.
+
 ### Download current data
 
 ```bash

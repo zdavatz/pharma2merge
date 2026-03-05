@@ -287,18 +287,42 @@ pub fn process_bundles(bundles: &[Value], current_dt: &DateTuple) -> PackageMap 
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                if subject_ref != ppd_key { continue; }
+                // Normalize CHIDMP prefix: new FOPH exports use
+                // "CHIDMPPackagedProductDefinition/..." instead of
+                // "PackagedProductDefinition/..."
+                let normalized_ref = subject_ref.strip_prefix("CHIDMP").unwrap_or(subject_ref);
+
+                if normalized_ref != ppd_key { continue; }
 
                 // This package has an SL entry via RegulatedAuthorization
                 has_sl_entry = true;
 
-                // Extract price extensions
-                let extensions = match auth.get("extension").and_then(|v| v.as_array()) {
+                // Extract price extensions — may be top-level or nested
+                // inside a reimbursementSL extension
+                let top_extensions = match auth.get("extension").and_then(|v| v.as_array()) {
                     Some(arr) => arr,
                     None => continue,
                 };
 
-                for ext in extensions {
+                let mut price_extensions: Vec<&Value> = Vec::new();
+                for ext in top_extensions {
+                    let url = ext.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    if url.contains("productPrice") {
+                        price_extensions.push(ext);
+                    } else if url.contains("reimbursementSL") {
+                        // New format: productPrice nested inside reimbursementSL
+                        if let Some(inner) = ext.get("extension").and_then(|v| v.as_array()) {
+                            for sub in inner {
+                                let sub_url = sub.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                if sub_url.contains("productPrice") {
+                                    price_extensions.push(sub);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for ext in &price_extensions {
                     let url = ext.get("url").and_then(|v| v.as_str()).unwrap_or("");
                     if !url.contains("productPrice") { continue; }
 
@@ -381,6 +405,26 @@ pub fn process_bundles(bundles: &[Value], current_dt: &DateTuple) -> PackageMap 
 }
 
 // ─── Public entry point ──────────────────────────────────────────────────────
+
+/// Extract a dd.mm.yyyy date string from a file path.
+pub fn extract_date_from_path(path: &str) -> String {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    for part in stem.split('_') {
+        let segments: Vec<&str> = part.split('.').collect();
+        if segments.len() == 3
+            && segments[0].len() <= 2
+            && segments[1].len() <= 2
+            && segments[2].len() == 4
+            && segments.iter().all(|s| s.chars().all(|c| c.is_ascii_digit()))
+        {
+            return part.to_string();
+        }
+    }
+    crate::get_file_mod_date(path)
+}
 
 pub fn run_foph_diff(old_file: &str, new_file: &str, filter: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     // Extract date strings from input filenames

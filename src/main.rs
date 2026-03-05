@@ -185,7 +185,163 @@ pub fn get_file_mod_date(filename: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Find the latest file by dd.mm.yyyy date in the filename.
+fn find_latest_file(dir: &str, prefix: &str, extension: &str) -> Option<String> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut matches: Vec<(String, (i32, i32, i32))> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(prefix) && name.ends_with(extension) {
+                let path = format!("{}/{}", dir, name);
+                // Extract dd.mm.yyyy from filename and parse to (year, month, day) for sorting
+                let stem = name.strip_suffix(extension).unwrap_or(&name);
+                let date_key = stem.split('_').find_map(|part| {
+                    let segs: Vec<&str> = part.split('.').collect();
+                    if segs.len() == 3
+                        && segs[0].len() <= 2 && segs[1].len() <= 2 && segs[2].len() == 4
+                        && segs.iter().all(|s| s.chars().all(|c| c.is_ascii_digit()))
+                    {
+                        let d: i32 = segs[0].parse().ok()?;
+                        let m: i32 = segs[1].parse().ok()?;
+                        let y: i32 = segs[2].parse().ok()?;
+                        Some((y, m, d))
+                    } else {
+                        None
+                    }
+                }).unwrap_or((0, 0, 0));
+                Some((path, date_key))
+            } else {
+                None
+            }
+        })
+        .collect();
+    matches.sort_by_key(|(_, date)| *date);
+    matches.last().map(|(path, _)| path.clone())
+}
+
+fn local_file_size(path: &str) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+
 // ─── Run modes ───────────────────────────────────────────────────────────────
+
+const SWISSMEDIC_SIZE_FILE: &str = "csv/.swissmedic_xlsx_size";
+
+fn run_update(html: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let today = Local::now().date_naive();
+    let date_str = format!("{:02}.{:02}.{}", today.day(), today.month(), today.year());
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    // Find latest local files
+    let latest_ndjson = find_latest_file("ndjson", "sl_foph_", ".ndjson");
+    let latest_csv = find_latest_file("csv", "swissmedic_", ".csv");
+
+    let foph_local_size = latest_ndjson.as_ref().map(|p| local_file_size(p)).unwrap_or(0);
+
+    if let Some(ref p) = latest_ndjson {
+        println!("Latest local FOPH:       {} ({} bytes)", p, foph_local_size);
+    } else {
+        println!("Latest local FOPH:       (none)");
+    }
+    if let Some(ref p) = latest_csv {
+        println!("Latest local Swissmedic: {}", p);
+    } else {
+        println!("Latest local Swissmedic: (none)");
+    }
+
+    // Step 1: Check Swissmedic XLSX size without downloading
+    let saved_xlsx_size: u64 = fs::read_to_string(SWISSMEDIC_SIZE_FILE)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    println!("\nChecking Swissmedic XLSX size (last known: {} bytes)...", saved_xlsx_size);
+    let resp = client.get(SWISSMEDIC_URL).send()?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} for {}", resp.status(), SWISSMEDIC_URL).into());
+    }
+    let xlsx_remote_size = resp.content_length().unwrap_or(0);
+
+    if xlsx_remote_size > 0 && xlsx_remote_size == saved_xlsx_size {
+        println!("Swissmedic XLSX unchanged ({} bytes). No new data.", xlsx_remote_size);
+        println!("\nBoth sources must have new data to proceed. Aborting.");
+        return Ok(());
+    }
+
+    // Content-Length was different or unavailable — read the full response
+    println!("Downloading Swissmedic XLSX...");
+    let xlsx_bytes = resp.bytes()?.to_vec();
+    println!("  Downloaded {} bytes", xlsx_bytes.len());
+
+    // If Content-Length was 0 (unavailable), compare with actual download size
+    if xlsx_bytes.len() as u64 == saved_xlsx_size {
+        println!("Swissmedic XLSX unchanged ({} bytes). No new data.", xlsx_bytes.len());
+        println!("\nBoth sources must have new data to proceed. Aborting.");
+        return Ok(());
+    }
+    println!("Swissmedic data new:     YES ({} vs {} bytes)", xlsx_bytes.len(), saved_xlsx_size);
+
+    // Step 2: Download NDJSON and compare size
+    let foph_url = resolve_foph_ndjson_url(&client)?;
+    let ndjson_bytes = download_url(&client, &foph_url)?;
+
+    let foph_is_new = ndjson_bytes.len() as u64 != foph_local_size;
+    println!("FOPH data new:           {} ({} vs {} bytes)",
+        if foph_is_new { "YES" } else { "no (same size)" },
+        ndjson_bytes.len(), foph_local_size);
+
+    if !foph_is_new {
+        println!("\nBoth sources must have new data to proceed. Aborting.");
+        return Ok(());
+    }
+
+    // Both are new — save files
+    println!("\nBoth sources have new data. Processing...\n");
+
+    fs::create_dir_all("ndjson")?;
+    fs::create_dir_all("csv")?;
+
+    let new_ndjson_path = format!("ndjson/sl_foph_{}.ndjson", date_str);
+    let new_csv_path = format!("csv/swissmedic_{}.csv", date_str);
+
+    File::create(&new_ndjson_path)?.write_all(&ndjson_bytes)?;
+    println!("  Saved: {}", new_ndjson_path);
+
+    xlsx_to_csv(&xlsx_bytes, &new_csv_path)?;
+
+    // Save XLSX size for future comparisons
+    File::create(SWISSMEDIC_SIZE_FILE)?
+        .write_all(format!("{}", xlsx_bytes.len()).as_bytes())?;
+
+    // Run diffs
+    let old_ndjson = latest_ndjson.ok_or("No previous FOPH NDJSON file found for diff")?;
+    let old_csv = latest_csv.ok_or("No previous Swissmedic CSV file found for diff")?;
+
+    println!("\n=== FOPH Diff: {} → {} ===\n", old_ndjson, new_ndjson_path);
+    foph_diff::run_foph_diff(&old_ndjson, &new_ndjson_path, None)?;
+
+    println!("\n=== Swissmedic Diff: {} → {} ===\n", old_csv, new_csv_path);
+    run_swissmedic_diff(&old_csv, &new_csv_path)?;
+
+    // Determine diff output filenames
+    let old_ndjson_date = foph_diff::extract_date_from_path(&old_ndjson);
+    let new_ndjson_date = foph_diff::extract_date_from_path(&new_ndjson_path);
+    let foph_diff_path = format!("ndjson/diff_{}-{}.json", old_ndjson_date, new_ndjson_date);
+
+    let old_csv_date = extract_swissmedic_date(&old_csv).unwrap_or_else(|| "old".to_string());
+    let new_csv_date = extract_swissmedic_date(&new_csv_path).unwrap_or_else(|| "new".to_string());
+    let sm_diff_path = format!("csv/diff_{}-{}.json", old_csv_date, new_csv_date);
+
+    println!("\n=== Merge: {} + {} ===\n", foph_diff_path, sm_diff_path);
+    run_merge(&foph_diff_path, &sm_diff_path, html)?;
+
+    Ok(())
+}
 
 fn run_download(swissmedic: bool, fhir: bool) -> Result<(), Box<dyn std::error::Error>> {
     let today = Local::now().date_naive();
@@ -884,6 +1040,11 @@ fn run_swissmedic_diff(old_file: &str, new_file: &str) -> Result<(), Box<dyn std
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
+    if args.len() >= 2 && args[1] == "--update" {
+        let html = args.get(2).map(|a| a.as_str()) == Some("--html");
+        return run_update(html);
+    }
+
     if args.len() >= 2 && args[1] == "--download" {
         if args.len() == 2 {
             return run_download(true, true);
@@ -919,6 +1080,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("Usage:");
+    eprintln!("  {} --update [--html]", args[0]);
+    eprintln!("    Download both sources, diff against latest local files, and merge.");
+    eprintln!("    Only proceeds if BOTH remote files differ in size from local ones.");
+    eprintln!();
     eprintln!("  {} --download", args[0]);
     eprintln!("    Download both Swissmedic xlsx (→ CSV) and FOPH SL ndjson.");
     eprintln!();

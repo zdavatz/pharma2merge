@@ -14,7 +14,9 @@ pharma2merge is a Rust CLI tool that diffs and merges Swiss pharmaceutical regis
 - **GTIN construction**: Built from Swissmedic registration number + pack code with EAN-13 checksum (`7680XXXXXYYYZ`)
 - **Numeric flags**: Integer codes 1-16 matching Ruby `ODDB::OuwerkerkPlugin::NUMERIC_FLAGS` — used consistently across both Swissmedic and FOPH diffs
 - **FOPH price evaluation**: Prices have `changeDate` fields; the tool picks the most recent price effective on or before the bundle's timestamp date
+- **FOPH FHIR compatibility**: Handles both old format (`PackagedProductDefinition/` refs, top-level `productPrice`) and new format (`CHIDMPPackagedProductDefinition/` refs, `productPrice` nested inside `reimbursementSL`)
 - **Parallel processing**: Uses `rayon` for concurrent NDJSON loading and bundle processing
+- **Update mode**: `--update` checks Swissmedic XLSX size (saved in `csv/.swissmedic_xlsx_size`) and FOPH NDJSON size against latest local files; only proceeds if both have new data
 
 ## Build & Run
 
